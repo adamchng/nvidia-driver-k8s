@@ -1,0 +1,125 @@
+---
+- name: Install Nvidia Device Plugin on Bare Metal K8s Node running on Rocky Linux 9
+  hosts: all
+  gather_facts: false
+
+  vars:
+  #- nvidia_driver: NVIDIA-Linux-x86_64-460.80.run
+  - nvidia_driver: NVIDIA-Linux-x86_64-525.105.17.run
+
+  tasks:
+  - name: install gcc, make, pciutils
+    yum:
+      name:
+      - kernel-devel
+      - dkms
+      - pciutils
+      - gcc
+      - make
+    become: yes
+    become_user: root
+
+  - name: check if nouveau driver already blacklisted
+    #shell: "grep nouveau /boot/grub2/grub.cfg | wc -l"
+    shell: "grep nouveau /boot/efi/EFI/rocky/grub.cfg | wc -l"
+    register: nouveau_blacklisted
+
+  - name: blacklist nouveau driver in /etc/default/grub
+    lineinfile:
+      dest: /etc/default/grub
+      regexp: "^GRUB_CMDLINE_LINUX"
+      #line: "GRUB_CMDLINE_LINUX=\"crashkernel=auto spectre_v2=retpoline rd.lvm.lv=centos/root rhgb quiet modprobe.blacklist=nouveau\""
+      line: "GRUB_CMDLINE_LINUX=\"resume=/dev/mapper/rocky-swap rd.lvm.lv=rocky/root rd.lvm.lv=rocky/swap modprobe.blacklist=nouveau\""
+      state: present
+    become: yes
+    become_user: root
+    when: nouveau_blacklisted.stdout == "0"
+
+  - name: copy over denylist.conf
+    copy:
+      src: files/denylist.conf
+      dest: /etc/modprobe.d/denylist.conf
+      owner: root
+      group: root
+      mode: 0644
+    become: yes
+    become_user: root
+    when: nouveau_blacklisted.stdout == "0"
+
+  - name: rebuild grub config
+    #shell: "grub2-mkconfig -o /boot/grub2/grub.cfg"
+    shell: "dracut --force; grub2-mkconfig -o /boot/efi/EFI/rocky/grub.cfg"
+    become: yes
+    become_user: root
+    when: nouveau_blacklisted.stdout == "0"
+
+  - name: reboot server
+    shell: "sleep 4 && reboot"
+    async: 1
+    poll: 0
+    become: yes
+    become_user: root
+    when: nouveau_blacklisted.stdout == "0"
+
+  - name: waiting for server to come back up
+    wait_for_connection:
+      delay: 40
+      timeout: 600
+    when: nouveau_blacklisted.stdout == "0"
+
+  - name: check if we already have nvidia driver file
+    stat:
+      path: "/tmp/{{ nvidia_driver }}"
+    register: nvidia_driver_file
+
+  - name: copy nvidia driver file
+    copy:
+      src: "/usr/local/src/{{ nvidia_driver }}"
+      dest: "/tmp/{{ nvidia_driver }}"
+      owner: root
+      group: root
+      mode: 0755
+    become: yes
+    become_user: root
+    when: not nvidia_driver_file.stat.exists
+
+  - name: check nvidia-smi is installed
+    stat:
+      path: "/usr/bin/nvidia-smi"
+    register: nvidia_smi
+
+  - name: install nvidia driver file
+    command: "/tmp/{{ nvidia_driver }} -q -a -n -X -s"
+    become: yes
+    become_user: root
+    when: not nvidia_smi.stat.exists
+
+  - name: grab nvidia-docker.repo
+    shell: "curl https://nvidia.github.io/nvidia-docker/centos7/nvidia-docker.repo > /etc/yum.repos.d/nvidia-docker.repo"
+    become: yes
+    become_user: root
+
+  - name: install nvidia-container-toolkit
+    yum:
+      name: nvidia-container-toolkit
+      state: latest
+    become: yes
+    become_user: root
+
+  - name: copy config.toml
+    copy:
+      src: files/config.toml
+      dest: /etc/containerd/config.toml
+      owner: root
+      group: root
+      mode: 0644
+    become: yes
+    become_user: root
+
+  - name: restart containerd service
+    systemd:
+      name: containerd
+      state: restarted
+      enabled: yes
+    become: yes
+    become_user: root
